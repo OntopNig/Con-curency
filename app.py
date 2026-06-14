@@ -159,11 +159,12 @@ async def fetch_products(domain, proxy_str=None):
         if not domain.startswith('http'):
             domain = "https://" + domain
         
+        connector = aiohttp.TCPConnector(ssl=False)
         timeout = aiohttp.ClientTimeout(total=10)
         
         proxy = parse_proxy(proxy_str) if proxy_str else None
         
-        async with aiohttp.ClientSession(connector=get_shared_connector(), connector_owner=False, timeout=timeout) as session:
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
             async with session.get(f"{domain}/products.json", proxy=proxy, timeout=10) as resp:
                 if resp.status != 200:
                     return False, f"<b>Site Error! Status: {resp.status}</b>"
@@ -291,9 +292,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return False, info[1], gateway, total_price, currency
             variant_id = info['variant_id']
 
+        connector = aiohttp.TCPConnector(ssl=False, limit=0, limit_per_host=0)
         timeout = aiohttp.ClientTimeout(total=15)
         
-        async with aiohttp.ClientSession(connector=get_shared_connector(), connector_owner=False, timeout=timeout) as session:
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
             url = ourl
             cart = url + '/cart/add.js'
             checkout = url + '/checkout/'
@@ -1014,7 +1016,6 @@ MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 2000))  # max cards in fli
 _loop = None                 # single shared event loop
 _loop_thread = None
 _semaphore = None            # asyncio.Semaphore(MAX_CONCURRENT)
-_shared_connector = None     # single shared TCPConnector for all sessions
 
 # ── Live stats ──────────────────────────────────────────────────────
 _active_cards = 0
@@ -1026,20 +1027,6 @@ def _start_background_loop(loop):
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
-def get_shared_connector():
-    """Return a shared TCPConnector, creating it on the event loop if needed."""
-    global _shared_connector
-    if _shared_connector is None or _shared_connector.closed:
-        _shared_connector = aiohttp.TCPConnector(
-            ssl=False,
-            limit=0,              # no global connection limit
-            limit_per_host=0,     # no per-host limit
-            ttl_dns_cache=300,    # cache DNS for 5 min
-            keepalive_timeout=30, # reuse TCP connections for 30s
-            enable_cleanup_closed=True,
-        )
-    return _shared_connector
-
 def get_event_loop():
     """Return the shared event loop, starting it if needed."""
     global _loop, _loop_thread, _semaphore
@@ -1048,13 +1035,7 @@ def get_event_loop():
         _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
         _loop_thread = threading.Thread(target=_start_background_loop, args=(_loop,), daemon=True)
         _loop_thread.start()
-        # Initialize the shared connector on the event loop
-        asyncio.run_coroutine_threadsafe(_init_connector(), _loop).result(timeout=5)
     return _loop
-
-async def _init_connector():
-    """Initialize the shared connector inside the event loop context."""
-    get_shared_connector()
 
 async def _throttled_process(cc, mes, ano, cvv, site_url, variant_id, proxy_str):
     """Process a single card, guarded by the concurrency semaphore."""
@@ -1208,7 +1189,6 @@ def status():
         "max_concurrent": MAX_CONCURRENT,
         "active_cards": _active_cards,
         "total_processed": _total_processed,
-        "connector_open": not _shared_connector.closed if _shared_connector else False,
         "endpoints": {
             "single": "GET /shopify?site=...&cc=...&proxy=...",
             "batch":  "POST /batch {site, cards[], proxy}",
@@ -1218,10 +1198,9 @@ def status():
 
 if __name__ == "__main__":
     print(f"[ENGINE] Max concurrency: {MAX_CONCURRENT} cards")
-    print(f"[ENGINE] Shared TCPConnector: connection reuse enabled")
     print(f"[ENGINE] Single: GET /shopify?site=...&cc=...&proxy=...")
     print(f"[ENGINE] Batch:  POST /batch  {{site, cards[], proxy}}")
-    get_event_loop()  # pre-start the background loop + connector
+    get_event_loop()  # pre-start the background loop
     port = int(os.environ.get("PORT", 5000))
     # Use Gunicorn in production (Procfile), Flask dev server as fallback
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
