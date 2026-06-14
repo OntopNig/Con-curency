@@ -1010,7 +1010,7 @@ def parse_cc_string(cc_string):
 # ──────────────────────── Concurrency Engine ────────────────────────
 import threading
 
-MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 300))  # max cards in flight at once
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 2000))  # max cards in flight at once
 _loop = None                 # single shared event loop
 _loop_thread = None
 _semaphore = None            # asyncio.Semaphore(MAX_CONCURRENT)
