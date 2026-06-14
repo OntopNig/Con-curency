@@ -1,2 +1,4 @@
 flask==2.3.3
 aiohttp==3.9.1
+asyncio
+gunicorn==21.2.0
