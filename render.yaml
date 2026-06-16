@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: evelyn-checker-api
+    runtime: python
+    plan: starter  # Change to your actual plan in Render dashboard
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --worker-class gthread --workers 4 --threads 150 --timeout 300 --keep-alive 30 --max-requests 5000 --max-requests-jitter 500 --preload
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.8
+      - key: MAX_CONCURRENT
+        value: 2000
+      - key: PORT
+        value: 10000
+    healthCheckPath: /status
+    autoDeploy: true
